@@ -1,0 +1,15 @@
+# Exemplo do inventário. O arquivo real (hosts.yml) é gerado pela pipeline a
+# partir dos outputs do Terraform: scripts/preparar-ansible.sh
+all:
+  vars:
+    ansible_user: ubuntu
+  children:
+    db:
+      hosts:
+        kubeshop-db:
+          ansible_host: 10.20.2.10
+          ansible_ssh_common_args: "-o ProxyJump=ubuntu@203.0.113.10"
+    app:
+      hosts:
+        kubeshop-app:
+          ansible_host: 203.0.113.10

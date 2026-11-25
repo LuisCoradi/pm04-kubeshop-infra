@@ -1,0 +1,298 @@
+name: "1. Deploy - Terraform + Ansible"
+
+# Cria ou atualiza o ambiente. Terraform provisiona; em seguida o Ansible
+# configura e mantém as VMs. Os parâmetros alteram de fato a infraestrutura
+# (tipos e nomes das VMs) ou a configuração (imagens, SO, pacotes).
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Ambiente de destino
+        type: choice
+        options: [dev, homolog, prod]
+        default: dev
+      instance_name:
+        description: "Nome base das VMs (vm-pm04 -> vm-pm04-<amb>-app e -db)"
+        type: string
+        default: vm-pm04
+      instance_type:
+        description: Tipo da VM da aplicação
+        type: choice
+        options: [t3.micro, t3.small]
+        default: t3.micro
+      db_instance_type:
+        description: Tipo da VM do MongoDB
+        type: choice
+        options: [t3.micro, t3.small]
+        default: t3.micro
+      docker_image:
+        description: "Prefixo das imagens (vazio = ghcr.io/<dono>/kubeshop; usa -api e -frontend)"
+        type: string
+        default: ""
+      docker_tag:
+        description: "Versão das imagens (tag fixa, ex.: 1.0.0)"
+        type: string
+        default: "1.0.0"
+      update_os:
+        description: Aplicar atualizações do sistema operacional
+        type: boolean
+        default: false
+      extra_packages:
+        description: "Pacotes adicionais, separados por vírgula (ex.: htop,git)"
+        type: string
+        default: "htop"
+      plan_only:
+        description: Somente planejar (terraform plan), sem aplicar
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: kubeshop-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  TERRAFORM_VERSION: "1.17.2"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  terraform:
+    name: Terraform (init, validate, plan, apply)
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment }}
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      changed: ${{ steps.plan.outputs.changed }}
+      tf_outputs: ${{ steps.outputs.outputs.json }}
+    steps:
+      - name: Baixar o repositório
+        uses: actions/checkout@v7
+
+      - name: Validar parâmetros
+        env:
+          INSTANCE_NAME: ${{ inputs.instance_name }}
+          DOCKER_IMAGE: ${{ inputs.docker_image }}
+          DOCKER_TAG: ${{ inputs.docker_tag }}
+          EXTRA_PACKAGES: ${{ inputs.extra_packages }}
+        run: |
+          re_name='^[a-z0-9][a-z0-9-]{1,30}$'
+          re_tag='^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'
+          re_image='^[a-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+$'
+          re_pkgs='^[a-z0-9.+, -]*$'
+          [[ "$INSTANCE_NAME" =~ $re_name ]] || { echo "::error::instance_name inválido"; exit 1; }
+          [[ "$DOCKER_TAG" =~ $re_tag ]] || { echo "::error::docker_tag inválido"; exit 1; }
+          [[ -z "$DOCKER_IMAGE" || "$DOCKER_IMAGE" =~ $re_image ]] || { echo "::error::docker_image inválido"; exit 1; }
+          [[ "$EXTRA_PACKAGES" =~ $re_pkgs ]] || { echo "::error::extra_packages inválido"; exit 1; }
+          if [[ "$DOCKER_TAG" =~ ^(latest|stable|main)$ ]]; then
+            echo "::warning::Tag mutável (${DOCKER_TAG}): a imagem será baixada de novo a cada execução."
+          fi
+
+      - name: Credenciais da AWS
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Bucket do Terraform State e dos backups
+        id: backend
+        run: bash scripts/bootstrap-backend.sh
+
+      - name: Instalar Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Chave pública SSH (derivada do secret)
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          pub="$(bash scripts/setup-ssh.sh public)"
+          echo "TF_VAR_ssh_public_key=${pub}" >>"$GITHUB_ENV"
+
+      - name: terraform init
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          BUCKET: ${{ steps.backend.outputs.bucket }}
+        run: bash scripts/tf-init.sh "$ENVIRONMENT" "$BUCKET"
+
+      - name: terraform fmt e validate
+        working-directory: terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform validate
+
+      - name: Parâmetros da execução (tfvars)
+        working-directory: terraform
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          INSTANCE_NAME: ${{ inputs.instance_name }}
+          INSTANCE_TYPE: ${{ inputs.instance_type }}
+          DB_INSTANCE_TYPE: ${{ inputs.db_instance_type }}
+          BUCKET: ${{ steps.backend.outputs.bucket }}
+          ADMIN_CIDRS: ${{ vars.ADMIN_CIDRS || '[]' }}
+          DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+        run: |
+          jq -n \
+            --arg environment "$ENVIRONMENT" \
+            --arg aws_region "$AWS_REGION" \
+            --arg instance_name "$INSTANCE_NAME" \
+            --arg instance_type "$INSTANCE_TYPE" \
+            --arg db_instance_type "$DB_INSTANCE_TYPE" \
+            --arg backup_bucket "$BUCKET" \
+            --argjson admin_cidrs "$ADMIN_CIDRS" \
+            --arg domain_name "$DOMAIN_NAME" \
+            '$ARGS.named' >pipeline.auto.tfvars.json
+          cat pipeline.auto.tfvars.json
+
+      - name: terraform plan
+        id: plan
+        working-directory: terraform
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set +e
+          terraform plan -input=false -no-color -detailed-exitcode -out=tfplan | tee plan.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          case "$rc" in
+            0) echo "changed=false" >>"$GITHUB_OUTPUT" ;;
+            2) echo "changed=true" >>"$GITHUB_OUTPUT" ;;
+            *) exit "$rc" ;;
+          esac
+          {
+            echo "### Terraform plan (${ENVIRONMENT})"
+            echo '```'
+            grep -E '^(Plan:|No changes|  # )' plan.txt | head -80
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: terraform apply
+        if: ${{ !inputs.plan_only && steps.plan.outputs.changed == 'true' }}
+        working-directory: terraform
+        run: terraform apply -input=false -no-color tfplan
+
+      - name: Outputs do Terraform
+        id: outputs
+        if: ${{ !inputs.plan_only }}
+        working-directory: terraform
+        run: |
+          json="$(terraform output -json | jq -c 'map_values(.value)')"
+          echo "json=${json}" >>"$GITHUB_OUTPUT"
+          echo "$json" | jq .
+          {
+            echo "### Infraestrutura"
+            echo "$json" | jq -r 'to_entries[] | "- **\(.key)**: \(.value)"'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  ansible:
+    name: Ansible (SO, pacotes, Docker e contêineres)
+    needs: terraform
+    if: ${{ !inputs.plan_only }}
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      TF_OUTPUTS: ${{ needs.terraform.outputs.tf_outputs }}
+    steps:
+      - name: Baixar o repositório
+        uses: actions/checkout@v7
+
+      - name: Instalar Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: ansible/requirements.txt
+
+      - name: Instalar Ansible
+        run: pip install -r ansible/requirements.txt
+
+      - name: Credenciais da AWS
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Chave SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: bash scripts/setup-ssh.sh client
+
+      - name: Inventário a partir do Terraform
+        run: |
+          echo "$TF_OUTPUTS" >tf-outputs.json
+          bash scripts/preparar-ansible.sh tf-outputs.json
+          {
+            echo "APP_IP=$(jq -r .app_public_ip tf-outputs.json)"
+            echo "APP_SG=$(jq -r .app_security_group_id tf-outputs.json)"
+            echo "STORE_URL=$(jq -r .store_url tf-outputs.json)"
+          } >>"$GITHUB_ENV"
+
+      - name: Liberar SSH temporário para este runner
+        run: bash scripts/runner-ssh.sh open "$APP_SG" "$APP_IP"
+
+      - name: Parâmetros da execução (Ansible)
+        env:
+          DOCKER_IMAGE: ${{ inputs.docker_image }}
+          DOCKER_TAG: ${{ inputs.docker_tag }}
+          UPDATE_OS: ${{ inputs.update_os }}
+          EXTRA_PACKAGES: ${{ inputs.extra_packages }}
+          OWNER: ${{ github.repository_owner }}
+          DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+          ACME_EMAIL: ${{ vars.ACME_EMAIL }}
+        run: |
+          image="${DOCKER_IMAGE:-ghcr.io/${OWNER,,}/kubeshop}"
+          jq -n \
+            --arg docker_image "$image" \
+            --arg app_version "$DOCKER_TAG" \
+            --argjson update_os "$UPDATE_OS" \
+            --arg extra "$EXTRA_PACKAGES" \
+            --arg domain_name "$DOMAIN_NAME" \
+            --arg acme_email "$ACME_EMAIL" \
+            '{docker_image: $docker_image, app_version: $app_version, update_os: $update_os,
+              extra_packages: ($extra | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))),
+              domain_name: $domain_name, acme_email: $acme_email}' >ansible/deploy-vars.json
+          cat ansible/deploy-vars.json
+
+      - name: ansible-playbook playbook.yml
+        working-directory: ansible
+        env:
+          MONGO_ROOT_PASSWORD: ${{ secrets.MONGO_ROOT_PASSWORD }}
+          MONGO_APP_PASSWORD: ${{ secrets.MONGO_APP_PASSWORD }}
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          ANSIBLE_FORCE_COLOR: "1"
+        run: ansible-playbook playbook.yml -e @infra-vars.json -e @deploy-vars.json
+
+      - name: Teste externo (como um usuário)
+        env:
+          DOCKER_TAG: ${{ inputs.docker_tag }}
+        run: bash scripts/smoke-externo.sh "$STORE_URL" "$DOCKER_TAG"
+
+      - name: Fechar SSH temporário
+        if: ${{ always() && env.APP_SG != '' }}
+        run: bash scripts/runner-ssh.sh close "$APP_SG"
+
+      - name: Resumo
+        if: ${{ success() }}
+        env:
+          DOCKER_TAG: ${{ inputs.docker_tag }}
+        run: |
+          {
+            echo "### Loja disponível"
+            echo "- Endereço: ${STORE_URL}"
+            echo "- Versão: ${DOCKER_TAG}"
+          } >>"$GITHUB_STEP_SUMMARY"

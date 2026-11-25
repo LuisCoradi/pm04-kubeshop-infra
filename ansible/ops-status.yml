@@ -1,0 +1,63 @@
+---
+# Rotina "status": saúde dos contêineres, versões, disco, memória, atualizações
+# pendentes e backups. Somente leitura.
+
+- name: Status do ambiente KubeShop
+  hosts: db:app
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Contêineres em execução
+      ansible.builtin.command: >-
+        docker ps --format "table {{ '{{' }}.Names{{ '}}' }}\t{{ '{{' }}.Image{{ '}}' }}\t{{ '{{' }}.Status{{ '}}' }}"
+      register: docker_ps
+      changed_when: false
+
+    - name: Disco e memória
+      ansible.builtin.shell: |
+        set -o pipefail
+        df -h / {{ data_mount if 'db' in group_names else '' }} | sed 1d
+        free -m | awk 'NR==2{printf "memória: %s MB usados de %s MB\n", $3, $2}'
+        uptime -p
+      args:
+        executable: /bin/bash
+      register: resources
+      changed_when: false
+
+    - name: Atualizações pendentes do SO
+      ansible.builtin.shell: |
+        set -o pipefail
+        apt list --upgradable 2>/dev/null | grep -c upgradable || true
+      args:
+        executable: /bin/bash
+      register: pending
+      changed_when: false
+
+    - name: Versão e saúde da aplicação
+      ansible.builtin.shell: |
+        docker exec frontend wget -q -O - http://127.0.0.1:8080/api/info; echo
+        docker exec frontend wget -q -O - http://127.0.0.1:8080/api/health/ready; echo
+      register: app_health
+      changed_when: false
+      failed_when: false
+      when: "'app' in group_names"
+
+    - name: Backups (agendamento e cópias locais)
+      ansible.builtin.shell: | # noqa: command-instead-of-module
+        set -o pipefail
+        systemctl list-timers kubeshop-backup.timer --no-pager | head -2
+        ls -lh {{ backup_dir }} 2>/dev/null | tail -n +2 || true
+      args:
+        executable: /bin/bash
+      register: backups
+      changed_when: false
+      when: "'db' in group_names"
+
+    - name: Resultado
+      ansible.builtin.debug:
+        msg:
+          - "{{ docker_ps.stdout_lines }}"
+          - "{{ resources.stdout_lines }}"
+          - "Atualizações pendentes do SO: {{ pending.stdout }}"
+          - "{{ app_health.stdout_lines | default([]) }}"
+          - "{{ backups.stdout_lines | default([]) }}"

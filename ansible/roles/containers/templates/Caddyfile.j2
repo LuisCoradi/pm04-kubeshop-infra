@@ -1,0 +1,26 @@
+# Gerenciado pelo Ansible (KubeShop). Entrada pública da loja.
+{
+	admin off
+{% if acme_email | length > 0 %}
+	email {{ acme_email }}
+{% endif %}
+	servers {
+		protocols h1 h2
+	}
+}
+
+{% if domain_name | length > 0 %}
+# HTTPS automático (Let's Encrypt). O registro DNS de {{ domain_name }}
+# precisa apontar para o IP elástico da VM da aplicação.
+{{ domain_name }} {
+{% else %}
+# Sem domínio: loja servida em HTTP pelo IP elástico.
+:80 {
+{% endif %}
+	encode zstd gzip
+	reverse_proxy frontend:8080
+	log {
+		output stdout
+		format console
+	}
+}

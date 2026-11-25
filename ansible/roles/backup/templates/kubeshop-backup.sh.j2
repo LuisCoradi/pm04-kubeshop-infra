@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Gerenciado pelo Ansible (KubeShop).
+# Backup lógico do banco "{{ mongo_database }}" (mongodump) com envio ao S3.
+# Executado diariamente pelo kubeshop-backup.timer e sob demanda pela pipeline.
+set -euo pipefail
+# shellcheck disable=SC1091
+source /etc/kubeshop/backup.env
+
+ts="$(date -u +%Y%m%dT%H%M%SZ)"
+name="kubeshop-${KUBESHOP_ENV}-${ts}.archive.gz"
+file="${BACKUP_DIR}/${name}"
+mkdir -p "$BACKUP_DIR"
+
+count_orders() {
+  docker exec mongodb mongosh --quiet --norc --eval '
+    const fs = require("fs");
+    const d = db.getSiblingDB(process.env.MONGO_INITDB_DATABASE);
+    d.auth(process.env.MONGO_APP_USERNAME,
+           fs.readFileSync(process.env.MONGO_APP_PASSWORD_FILE, "utf8").trim());
+    print(d.orders.countDocuments());'
+}
+
+orders="$(count_orders)"
+
+# A senha do administrador fica em /run/secrets/mongo-tools.yaml dentro do
+# contêiner (não aparece na linha de comando).
+docker exec mongodb mongodump --quiet \
+  --config=/run/secrets/mongo-tools.yaml \
+  --username="$MONGO_ROOT_USERNAME" --authenticationDatabase=admin \
+  --db="$MONGO_DATABASE" --archive --gzip >"${file}.partial"
+mv "${file}.partial" "$file"
+bytes="$(stat -c%s "$file")"
+
+destination="local:${file}"
+if [ -n "${BACKUP_BUCKET}" ]; then
+  key="backups/${KUBESHOP_ENV}/${name}"
+  /usr/local/bin/aws s3 cp "$file" "s3://${BACKUP_BUCKET}/${key}" --only-show-errors
+  destination="s3://${BACKUP_BUCKET}/${key}"
+fi
+
+# Mantém apenas as cópias locais mais recentes (o S3 guarda 14 dias).
+find "$BACKUP_DIR" -maxdepth 1 -name 'kubeshop-*.archive.gz' -printf '%T@ %p\n' \
+  | sort -rn | tail -n +"$((BACKUP_KEEP_LOCAL + 1))" | cut -d' ' -f2- \
+  | xargs -r rm -f
+
+printf '{"resultado":"OK","arquivo":"%s","bytes":%s,"pedidos":%s,"destino":"%s"}\n' \
+  "$name" "$bytes" "$orders" "$destination"

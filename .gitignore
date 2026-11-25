@@ -1,0 +1,21 @@
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl.bak
+*.tfstate
+*.tfstate.*
+terraform/tfplan
+terraform/destroy.tfplan
+terraform/plan.txt
+terraform/*.auto.tfvars.json
+
+# Gerados pela pipeline
+tf-outputs.json
+ansible/inventory/hosts.yml
+ansible/infra-vars.json
+ansible/deploy-vars.json
+ansible/ops-vars.json
+
+# Segredos locais
+*.pem
+.secrets/
+kubeshop-pm04*

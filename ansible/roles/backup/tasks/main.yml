@@ -1,0 +1,88 @@
+---
+# Backup lógico diário do MongoDB (mongodump) enviado ao S3, com rotina de
+# restauração testável em contêiner isolado. A VM usa o perfil IAM criado pelo
+# Terraform: nenhuma chave da AWS fica gravada no servidor.
+
+- name: Verificar se o AWS CLI já está instalado
+  ansible.builtin.stat:
+    path: /usr/local/bin/aws
+  register: aws_cli
+
+- name: Instalar o AWS CLI v2
+  when: not aws_cli.stat.exists
+  block:
+    - name: Baixar o instalador do AWS CLI v2
+      ansible.builtin.get_url:
+        url: https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+        dest: /tmp/awscliv2.zip
+        mode: "0644"
+
+    - name: Descompactar o instalador
+      ansible.builtin.unarchive:
+        src: /tmp/awscliv2.zip
+        dest: /tmp
+        remote_src: true
+
+    - name: Executar o instalador
+      ansible.builtin.command: /tmp/aws/install
+      args:
+        creates: /usr/local/bin/aws
+
+    - name: Remover arquivos temporários do instalador
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/awscliv2.zip
+        - /tmp/aws
+
+- name: Criar diretórios de backup e configuração
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ backup_dir }}", mode: "0700" }
+    - { path: /etc/kubeshop, mode: "0755" }
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Configuração do backup (sem segredos)
+  ansible.builtin.template:
+    src: backup.env.j2
+    dest: /etc/kubeshop/backup.env
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Instalar scripts de backup e restauração
+  ansible.builtin.template:
+    src: "{{ item }}.sh.j2"
+    dest: "/usr/local/bin/{{ item }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - kubeshop-backup
+    - kubeshop-restore
+
+- name: Instalar serviço e agendamento do backup (systemd)
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - kubeshop-backup.service
+    - kubeshop-backup.timer
+  register: backup_units
+
+- name: Ativar o backup automático diário
+  ansible.builtin.systemd_service:
+    name: kubeshop-backup.timer
+    enabled: true
+    state: started
+    daemon_reload: "{{ backup_units is changed }}"

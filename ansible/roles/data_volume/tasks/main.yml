@@ -1,0 +1,64 @@
+---
+# Volume EBS dedicado aos dados do MongoDB. O filesystem só é criado se o
+# disco estiver vazio: dados existentes nunca são formatados.
+
+- name: Validar o volume de dados informado pelo Terraform
+  ansible.builtin.assert:
+    that: db_data_volume_id is match('^vol-[0-9a-f]+$')
+    fail_msg: "db_data_volume_id ausente ou inválido (vem do output do Terraform)."
+    quiet: true
+
+- name: Identificar o dispositivo do volume (NVMe nas instâncias Nitro)
+  ansible.builtin.set_fact:
+    data_device: "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_{{ db_data_volume_id | replace('-', '') }}"
+
+- name: Aguardar o volume aparecer na VM
+  ansible.builtin.wait_for:
+    path: "{{ data_device }}"
+    timeout: 300
+
+- name: Criar filesystem ext4 (somente em disco vazio)
+  community.general.filesystem:
+    fstype: ext4
+    dev: "{{ data_device }}"
+
+- name: Montar o volume de dados (persistente no fstab)
+  ansible.posix.mount:
+    path: "{{ data_mount }}"
+    src: "{{ data_device }}"
+    fstype: ext4
+    opts: defaults,nofail
+    state: mounted
+
+- name: Criar diretórios do MongoDB no volume (usuário 999 do contêiner)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "999"
+    group: "999"
+    mode: "0750"
+  loop:
+    - "{{ data_mount }}/mongo"
+    - "{{ data_mount }}/mongo/db"
+    - "{{ data_mount }}/mongo/configdb"
+
+- name: Criar diretório de override do serviço Docker
+  ansible.builtin.file:
+    path: /etc/systemd/system/docker.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# Garante que o Docker só suba depois do volume montado. Sem isso, após um
+# reboot o MongoDB poderia iniciar gravando no disco do sistema.
+- name: Docker depende do volume de dados montado
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/docker.service.d/10-kubeshop-data.conf
+    content: |
+      [Unit]
+      RequiresMountsFor={{ data_mount }}
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Recarregar systemd

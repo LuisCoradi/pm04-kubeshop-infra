@@ -1,0 +1,2 @@
+# Ansible com as coleções community.docker, community.general e ansible.posix.
+ansible==15.0.0

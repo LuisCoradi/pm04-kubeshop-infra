@@ -1,0 +1,76 @@
+---
+# MongoDB autenticado, publicado só no IP privado da VM. O security group da
+# AWS libera a 27017 apenas para a VM da aplicação.
+
+- name: Gravar as senhas do MongoDB (lidas pelo contêiner, usuário 999)
+  ansible.builtin.copy:
+    content: "{{ item.value }}"
+    dest: "{{ kubeshop_dir }}/secrets/{{ item.name }}"
+    owner: "999"
+    group: "999"
+    mode: "0400"
+  loop:
+    - { name: mongo-root-password, value: "{{ mongo_root_password }}" }
+    - { name: mongo-app-password, value: "{{ mongo_app_password }}" }
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: true
+
+# Usado por mongodump/mongorestore: a senha fica em arquivo, não na linha de
+# comando nem nos logs.
+- name: Gravar configuração das ferramentas de backup do MongoDB
+  ansible.builtin.copy:
+    content: "password: {{ mongo_root_password | to_json }}\n"
+    dest: "{{ kubeshop_dir }}/secrets/mongo-tools.yaml"
+    owner: root
+    group: root
+    mode: "0400"
+  no_log: true
+
+- name: Copiar scripts de inicialização e saúde do MongoDB
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ kubeshop_dir }}/config/{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0444"
+  loop:
+    - { src: mongo-init.js, dest: mongo-init.js }
+    - { src: mongo-healthcheck.js, dest: mongo-healthcheck.js }
+
+- name: MongoDB ({{ mongo_image }})
+  community.docker.docker_container:
+    name: mongodb
+    image: "{{ mongo_image }}"
+    pull: missing
+    command: ["--bind_ip_all", "--wiredTigerCacheSizeGB", "{{ mongo_cache_gb }}"]
+    env:
+      MONGO_INITDB_ROOT_USERNAME: "{{ mongo_root_username }}"
+      MONGO_INITDB_ROOT_PASSWORD_FILE: /run/secrets/mongo_root_password
+      MONGO_INITDB_DATABASE: "{{ mongo_database }}"
+      MONGO_APP_USERNAME: "{{ mongo_app_username }}"
+      MONGO_APP_PASSWORD_FILE: /run/secrets/mongo_app_password
+    volumes:
+      - "{{ data_mount }}/mongo/db:/data/db"
+      - "{{ data_mount }}/mongo/configdb:/data/configdb"
+      - "{{ kubeshop_dir }}/config/mongo-init.js:/docker-entrypoint-initdb.d/10-app-user.js:ro"
+      - "{{ kubeshop_dir }}/config/mongo-healthcheck.js:/opt/healthcheck.js:ro"
+      - "{{ kubeshop_dir }}/secrets/mongo-root-password:/run/secrets/mongo_root_password:ro"
+      - "{{ kubeshop_dir }}/secrets/mongo-app-password:/run/secrets/mongo_app_password:ro"
+      - "{{ kubeshop_dir }}/secrets/mongo-tools.yaml:/run/secrets/mongo-tools.yaml:ro"
+    published_ports:
+      - "{{ db_private_ip }}:{{ mongo_port }}:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--file", "/opt/healthcheck.js"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    security_opts:
+      - no-new-privileges:true
+    stop_timeout: 30
+    restart_policy: unless-stopped
+    labels:
+      app.kubeshop.component: mongodb
+    state: healthy
+    healthy_wait_timeout: 240

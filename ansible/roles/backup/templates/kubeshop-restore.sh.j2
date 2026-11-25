@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Gerenciado pelo Ansible (KubeShop).
+# Restauração de um backup do S3.
+#
+#   kubeshop-restore verify  [latest|<arquivo>]
+#       Restaura em um contêiner MongoDB temporário e isolado (sem rede) e
+#       confere os pedidos. Não toca no banco em produção.
+#
+#   CONFIRM="RESTAURAR <ambiente>" kubeshop-restore replace [latest|<arquivo>]
+#       Faz um backup de segurança e substitui os dados do banco em uso.
+set -euo pipefail
+# shellcheck disable=SC1091
+source /etc/kubeshop/backup.env
+
+mode="${1:-verify}"
+ref="${2:-latest}"
+test_container="kubeshop-restore-test"
+workdir="$(mktemp -d)"
+
+cleanup() {
+  docker rm -f "$test_container" >/dev/null 2>&1 || true
+  rm -rf "$workdir"
+}
+trap cleanup EXIT
+
+case "$mode" in
+  verify | replace) ;;
+  *)
+    echo "uso: kubeshop-restore <verify|replace> [latest|<arquivo>]" >&2
+    exit 2
+    ;;
+esac
+
+[ -n "${BACKUP_BUCKET}" ] || { echo "BACKUP_BUCKET não configurado." >&2; exit 1; }
+prefix="backups/${KUBESHOP_ENV}/"
+
+if [ "$ref" = "latest" ]; then
+  key="$(/usr/local/bin/aws s3api list-objects-v2 --bucket "$BACKUP_BUCKET" \
+    --prefix "$prefix" --query 'sort_by(Contents,&LastModified)[-1].Key' --output text)"
+  if [ -z "$key" ] || [ "$key" = "None" ]; then
+    echo "Nenhum backup encontrado em s3://${BACKUP_BUCKET}/${prefix}" >&2
+    exit 1
+  fi
+else
+  key="${prefix}${ref##*/}"
+fi
+
+archive="${workdir}/backup.archive.gz"
+/usr/local/bin/aws s3 cp "s3://${BACKUP_BUCKET}/${key}" "$archive" --only-show-errors
+
+count_live() {
+  docker exec mongodb mongosh --quiet --norc --eval '
+    const fs = require("fs");
+    const d = db.getSiblingDB(process.env.MONGO_INITDB_DATABASE);
+    d.auth(process.env.MONGO_APP_USERNAME,
+           fs.readFileSync(process.env.MONGO_APP_PASSWORD_FILE, "utf8").trim());
+    print(d.orders.countDocuments());'
+}
+
+live_orders="$(count_live)"
+
+if [ "$mode" = "verify" ]; then
+  docker rm -f "$test_container" >/dev/null 2>&1 || true
+  docker run -d --name "$test_container" --network none --memory 400m \
+    "$MONGO_IMAGE" --wiredTigerCacheSizeGB 0.1 >/dev/null
+
+  for _ in $(seq 1 30); do
+    if docker exec "$test_container" mongosh --quiet --norc \
+      --eval 'print(db.runCommand({ping: 1}).ok)' 2>/dev/null | grep -q 1; then
+      break
+    fi
+    sleep 2
+  done
+
+  docker exec -i "$test_container" mongorestore --quiet --archive --gzip \
+    --nsInclude="${MONGO_DATABASE}.*" <"$archive"
+
+  result="$(docker exec "$test_container" mongosh --quiet --norc --eval "
+    const d = db.getSiblingDB('${MONGO_DATABASE}');
+    const last = d.orders.find().sort({createdAt: -1}).limit(1).toArray()[0];
+    print(JSON.stringify({
+      pedidos: d.orders.countDocuments(),
+      ultimo_pedido: last ? {id: String(last._id), criado_em: last.createdAt, total_centavos: last.totalCents} : null
+    }));")"
+
+  printf '{"modo":"verify","backup":"%s","banco_em_uso_pedidos":%s,"restaurado":%s}\n' \
+    "$key" "$live_orders" "$result"
+  exit 0
+fi
+
+# replace
+expected="RESTAURAR ${KUBESHOP_ENV}"
+if [ "${CONFIRM:-}" != "$expected" ]; then
+  echo "Confirmação ausente: informe CONFIRM=\"${expected}\"." >&2
+  exit 3
+fi
+
+echo "Backup de segurança antes de substituir os dados:" >&2
+/usr/local/bin/kubeshop-backup >&2
+
+docker exec -i mongodb mongorestore --quiet \
+  --config=/run/secrets/mongo-tools.yaml \
+  --username="$MONGO_ROOT_USERNAME" --authenticationDatabase=admin \
+  --archive --gzip --drop --nsInclude="${MONGO_DATABASE}.*" <"$archive"
+
+printf '{"modo":"replace","backup":"%s","pedidos_antes":%s,"pedidos_depois":%s}\n' \
+  "$key" "$live_orders" "$(count_live)"

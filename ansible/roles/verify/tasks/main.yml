@@ -1,0 +1,59 @@
+---
+# Confirma que tudo o que a demanda exige está em execução. Só lê o estado:
+# não altera nada (idempotente).
+
+- name: Definir contêineres esperados nesta VM
+  ansible.builtin.set_fact:
+    expected_containers: >-
+      {{ (['mongodb'] if 'db' in group_names else [])
+         + (['api', 'frontend', 'caddy'] if 'app' in group_names else []) }}
+
+- name: Consultar contêineres
+  community.docker.docker_container_info:
+    name: "{{ item }}"
+  loop: "{{ expected_containers }}"
+  register: containers_info
+
+- name: Conferir se os contêineres estão rodando e saudáveis
+  ansible.builtin.assert:
+    that:
+      - item.exists
+      - item.container.State.Running
+      - (item.container.State.Health is not defined) or (item.container.State.Health.Status == 'healthy')
+    fail_msg: "Contêiner {{ item.item }} não está rodando/saudável."
+    success_msg: "{{ item.item }}: {{ item.container.Config.Image }} em execução"
+  loop: "{{ containers_info.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Conferir o serviço Docker
+  ansible.builtin.systemd_service:
+    name: docker
+  register: docker_service
+  failed_when: docker_service.status.ActiveState != 'active'
+
+- name: Conferir o agendamento do backup (VM do banco)
+  ansible.builtin.systemd_service:
+    name: kubeshop-backup.timer
+  register: backup_timer
+  failed_when: backup_timer.status.ActiveState != 'active'
+  when: "'db' in group_names"
+
+- name: Testar a cadeia frontend -> API -> MongoDB (VM da aplicação)
+  ansible.builtin.command: docker exec frontend wget -q -O - http://127.0.0.1:8080/api/health/ready
+  register: ready
+  changed_when: false
+  failed_when: ready.rc != 0 or '"ready":true' not in ready.stdout
+  retries: 6
+  delay: 5
+  until: ready.rc == 0 and '"ready":true' in ready.stdout
+  when: "'app' in group_names"
+
+- name: Resumo da VM
+  ansible.builtin.debug:
+    msg:
+      vm: "{{ inventory_hostname }} ({{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}, kernel {{ ansible_facts['kernel'] }})"
+      contêineres: "{{ containers_info.results | map(attribute='container.Config.Image') | list }}"
+      atualizações_pendentes_do_SO: "{{ os_pending.stdout | default('n/d') }}"
+      backup_diário: "{{ backup_timer.status.ActiveState | default('n/a') }}"
+      saúde_da_aplicação: "{{ ready.stdout | default('n/a') }}"

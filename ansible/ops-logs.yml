@@ -1,0 +1,41 @@
+---
+# Rotina "logs": últimas linhas dos contêineres (service=all|api|frontend|caddy|mongodb).
+# A API registra JSON sem dados pessoais nem credenciais.
+
+- name: Logs do KubeShop
+  hosts: db:app
+  become: true
+  gather_facts: false
+  vars:
+    service: all
+    lines: 100
+    host_containers: >-
+      {{ (['mongodb'] if 'db' in group_names else [])
+         + (['api', 'frontend', 'caddy'] if 'app' in group_names else []) }}
+    selected: "{{ host_containers if service == 'all' else (host_containers | select('equalto', service) | list) }}"
+  tasks:
+    - name: Ler logs dos contêineres
+      ansible.builtin.command: docker logs --timestamps --tail {{ lines | int }} {{ item }}
+      loop: "{{ selected }}"
+      register: logs
+      changed_when: false
+
+    - name: Exibir logs
+      ansible.builtin.debug:
+        msg: "{{ (item.stdout_lines + item.stderr_lines) | sort }}"
+      loop: "{{ logs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Últimas execuções do backup
+      ansible.builtin.command: journalctl -u kubeshop-backup.service -n 20 --no-pager -o short-iso
+      register: backup_journal
+      changed_when: false
+      when:
+        - "'db' in group_names"
+        - service in ['all', 'mongodb']
+
+    - name: Exibir execuções do backup
+      ansible.builtin.debug:
+        var: backup_journal.stdout_lines
+      when: backup_journal.stdout_lines is defined

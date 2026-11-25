@@ -1,0 +1,46 @@
+---
+- name: Instalar pacotes base e pacotes extras solicitados
+  ansible.builtin.apt:
+    name: "{{ base_packages + (extra_packages | default([])) }}"
+    state: present
+    lock_timeout: 600
+
+- name: Definir fuso horário
+  community.general.timezone:
+    name: "{{ timezone }}"
+
+# t3.micro tem 1 GB de RAM: o swap evita que o MongoDB ou a API sejam
+# encerrados por falta de memória em picos.
+- name: Criar arquivo de swap
+  ansible.builtin.command: fallocate -l {{ swap_size_mb }}M /swapfile
+  args:
+    creates: /swapfile
+  when: swap_size_mb | int > 0
+  notify: Formatar e ativar o swap
+
+- name: Proteger o arquivo de swap
+  ansible.builtin.file:
+    path: /swapfile
+    owner: root
+    group: root
+    mode: "0600"
+  when: swap_size_mb | int > 0
+
+- name: Ativar o swap na inicialização
+  ansible.posix.mount:
+    path: none
+    src: /swapfile
+    fstype: swap
+    opts: sw
+    state: present
+  when: swap_size_mb | int > 0
+
+- name: Usar swap só quando necessário
+  ansible.posix.sysctl:
+    name: vm.swappiness
+    value: "10"
+    state: present
+    sysctl_set: true
+
+- name: Ativar o swap antes de subir os contêineres
+  ansible.builtin.meta: flush_handlers

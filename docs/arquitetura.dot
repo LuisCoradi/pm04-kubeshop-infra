@@ -1,0 +1,36 @@
+digraph kubeshop {
+  graph [rankdir=TB, fontname="Helvetica", fontsize=12, bgcolor="white", pad=0.3, nodesep=0.45, ranksep=0.7,
+         label="KubeShop (Zibiska Korp) - AWS us-east-1 - Terraform + Ansible + GitHub Actions", labelloc=t, fontsize=16];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, fillcolor="#ffffff", color="#5b6770"];
+  edge  [fontname="Helvetica", fontsize=10, color="#5b6770"];
+
+  user  [label="Usuários\n(navegador)", shape=oval, fillcolor="#eef3f8"];
+  gh    [label="GitHub Actions\n0. App (build imagens)\n1. Deploy (Terraform -> Ansible)\n2. Operações | 3. Desativar", fillcolor="#f3eefa"];
+  ghcr  [label="GHCR\nkubeshop-api:<tag>\nkubeshop-frontend:<tag>", fillcolor="#f3eefa"];
+  s3    [label="S3 kubeshop-<conta>-<região>\ntfstate/<amb>/ (versionado, lock)\nbackups/<amb>/ (14 dias)", fillcolor="#fff6e5"];
+
+  subgraph cluster_vpc {
+    label="VPC 10.20.0.0/16 (rede privada)"; style="rounded,dashed"; color="#8aa0b4"; fontcolor="#41566b";
+
+    subgraph cluster_app {
+      label="Sub-rede app 10.20.1.0/24 - SG app: 80/443 internet; 22 só runner da pipeline";
+      style="rounded,filled"; fillcolor="#eaf5ea"; color="#7fb07f";
+      app [label="VM 1 - aplicação (t3.micro)\nIP elástico\n\nCaddy :80/:443 (HTTP/HTTPS)\n-> frontend Nginx+React :8080\n-> API Node/Express :3000", fillcolor="#ffffff"];
+    }
+
+    subgraph cluster_db {
+      label="Sub-rede db 10.20.2.0/24 - SG db: 27017 e 22 só a partir do SG app";
+      style="rounded,filled"; fillcolor="#fdeeee"; color="#c98a8a";
+      db [label="VM 2 - MongoDB exclusivo (t3.micro)\n10.20.2.10:27017 (só IP privado)\nvolume EBS de dados 10 GB\nbackup diário (systemd timer)", fillcolor="#ffffff"];
+    }
+  }
+
+  user -> app [label="HTTP/HTTPS 80/443"];
+  app  -> db  [label="27017/TCP\nrede privada", color="#2e7d32", fontcolor="#2e7d32", penwidth=1.6];
+  user -> db  [label="27017 e 22 bloqueados", color="#c62828", fontcolor="#c62828", style=dashed, arrowhead=tee];
+  gh   -> app [label="SSH 22 (temporário)\n+ ProxyJump p/ db", style=dashed];
+  gh   -> s3  [label="Terraform State", style=dashed];
+  gh   -> ghcr [label="push imagens", style=dashed];
+  app  -> ghcr [label="pull <tag>", style=dotted];
+  db   -> s3  [label="mongodump\n(perfil IAM)", style=dotted];
+}

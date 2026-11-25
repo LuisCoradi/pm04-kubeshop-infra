@@ -1,0 +1,45 @@
+---
+# Playbook principal executado pela pipeline depois do Terraform.
+# Prepara as VMs do zero e mantém SO, pacotes, Docker e contêineres.
+
+- name: Preparar as VMs (sistema operacional, pacotes e Docker)
+  hosts: db:app
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: Aguardar o SSH das VMs (recém-criadas ou reiniciadas)
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Coletar informações do sistema
+      ansible.builtin.setup:
+
+    - name: Aguardar o cloud-init terminar a inicialização da VM
+      ansible.builtin.command: cloud-init status --wait
+      register: cloud_init
+      changed_when: false
+      failed_when: cloud_init.rc not in [0, 2]
+  roles:
+    - os_updates
+    - packages
+    - docker
+
+- name: VM exclusiva do MongoDB
+  hosts: db
+  become: true
+  roles:
+    - data_volume
+    - containers
+    - backup
+
+- name: VM da aplicação (API, frontend e entrada HTTP/HTTPS)
+  hosts: app
+  become: true
+  roles:
+    - containers
+
+- name: Verificar serviços e contêineres esperados
+  hosts: db:app
+  become: true
+  roles:
+    - verify

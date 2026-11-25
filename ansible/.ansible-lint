@@ -1,0 +1,8 @@
+---
+profile: production
+exclude_paths:
+  - inventory/hosts.yml
+  - infra-vars.json
+  - deploy-vars.json
+skip_list:
+  - var-naming[no-role-prefix]   # variáveis compartilhadas entre roles, definidas em group_vars

@@ -1,0 +1,70 @@
+name: "CI - validação do código de infraestrutura"
+
+# Valida Terraform, Ansible, workflows e scripts a cada push/PR, sem acessar a
+# AWS (não precisa de secrets).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TERRAFORM_VERSION: "1.17.2"
+
+jobs:
+  terraform:
+    name: Terraform fmt e validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - name: fmt
+        run: terraform -chdir=terraform fmt -check -recursive -diff
+      - name: init (sem backend) e validate
+        run: |
+          terraform -chdir=terraform init -backend=false -input=false
+          terraform -chdir=terraform validate
+
+  ansible:
+    name: Ansible syntax-check e lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Instalar Ansible e ansible-lint
+        run: pip install -r ansible/requirements.txt ansible-lint
+      - name: syntax-check
+        working-directory: ansible
+        run: |
+          for playbook in playbook.yml ops-*.yml; do
+            ansible-playbook -i inventory/exemplo.yml --syntax-check "$playbook"
+          done
+      - name: ansible-lint (perfil production)
+        working-directory: ansible
+        env:
+          ANSIBLE_INVENTORY: inventory/exemplo.yml
+        run: ansible-lint --offline
+
+  workflows-scripts:
+    name: actionlint e shellcheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Instalar linters
+        run: pip install actionlint-py shellcheck-py
+      - name: actionlint
+        run: actionlint
+      - name: shellcheck
+        run: shellcheck scripts/*.sh

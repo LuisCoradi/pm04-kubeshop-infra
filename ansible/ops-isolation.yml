@@ -1,0 +1,39 @@
+---
+# Rotina "isolation-check" (parte interna). A parte externa roda no runner do
+# GitHub (tentativa de acessar a 27017 pela internet, que deve falhar).
+
+- name: Teste de isolamento do banco (lado interno)
+  hosts: app
+  become: true
+  gather_facts: false
+  tasks:
+    - name: VM da aplicação alcança o MongoDB pela rede privada
+      ansible.builtin.command: nc -z -v -w 5 {{ db_private_ip }} {{ mongo_port }}
+      register: private_access
+      changed_when: false
+
+    - name: Resultado
+      ansible.builtin.debug:
+        msg: "OK: {{ private_access.stderr | default(private_access.stdout) }}"
+
+- name: Teste de isolamento do banco (porta só no IP privado)
+  hosts: db
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Portas em escuta na VM do banco
+      ansible.builtin.shell: |
+        set -o pipefail
+        ss -ltnH | awk '{print $4}' | sort -u
+      args:
+        executable: /bin/bash
+      register: listening
+      changed_when: false
+
+    - name: Conferir que a 27017 está publicada somente no IP privado
+      ansible.builtin.assert:
+        that:
+          - (db_private_ip ~ ':' ~ mongo_port) in listening.stdout_lines
+          - ('0.0.0.0:' ~ mongo_port) not in listening.stdout_lines
+        success_msg: "27017 publicada apenas em {{ db_private_ip }}: {{ listening.stdout_lines }}"
+        fail_msg: "Publicação inesperada da 27017: {{ listening.stdout_lines }}"

@@ -1,0 +1,61 @@
+---
+# Valores padrão. A pipeline sobrescreve com:
+#   -e @infra-vars.json   (outputs do Terraform)
+#   -e @deploy-vars.json  (parâmetros informados na execução)
+# Senhas e tokens vêm de variáveis de ambiente preenchidas pelos GitHub Secrets.
+
+environment_name: dev
+aws_region: us-east-1
+timezone: America/Sao_Paulo
+kubeshop_dir: /opt/kubeshop
+
+# --- Sistema operacional e pacotes -----------------------------------------
+update_os: false                 # parâmetro update_os da pipeline
+allow_reboot: true               # reinicia (uma VM por vez) se o kernel exigir
+disable_unattended_upgrades: true  # o SO só muda quando a pipeline manda
+base_packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - jq
+  - unzip
+  - netcat-openbsd
+  - python3-requests
+extra_packages: []               # parâmetro extra_packages da pipeline
+swap_size_mb: 1024
+
+# --- Imagens ---------------------------------------------------------------
+# docker_image é o prefixo: <prefixo>-api e <prefixo>-frontend.
+docker_image: ghcr.io/troque-pelo-dono-do-repo/kubeshop
+app_version: "1.0.0"             # parâmetro docker_tag da pipeline
+api_image: "{{ docker_image }}-api"
+frontend_image: "{{ docker_image }}-frontend"
+mongo_image: mongo:8.0.17        # mesma versão validada pela Zibiska Korp
+caddy_image: caddy:2.11.9-alpine
+mutable_tags: [latest, stable, main]
+rollback_on_failure: true
+registry_host: "{{ docker_image.split('/')[0] }}"
+registry_username: "{{ lookup('ansible.builtin.env', 'REGISTRY_USERNAME') }}"
+registry_password: "{{ lookup('ansible.builtin.env', 'REGISTRY_PASSWORD') }}"
+
+# --- Banco -----------------------------------------------------------------
+db_private_ip: 10.20.2.10
+mongo_port: 27017
+mongo_database: kubeshop
+mongo_app_username: kubeshop
+mongo_root_username: admin
+mongo_root_password: "{{ lookup('ansible.builtin.env', 'MONGO_ROOT_PASSWORD') }}"
+mongo_app_password: "{{ lookup('ansible.builtin.env', 'MONGO_APP_PASSWORD') }}"
+mongo_cache_gb: "0.25"
+db_data_volume_id: ""
+data_mount: /srv/kubeshop-data
+
+# --- Publicação ------------------------------------------------------------
+domain_name: ""                  # vazio = http://<IP elástico>
+acme_email: ""
+
+# --- Backup ----------------------------------------------------------------
+backup_bucket: ""
+backup_dir: /var/backups/kubeshop
+backup_schedule: "*-*-* 03:00:00"
+backup_keep_local: 3

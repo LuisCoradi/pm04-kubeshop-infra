@@ -1,0 +1,4 @@
+---
+- name: Formatar e ativar o swap
+  ansible.builtin.shell: mkswap /swapfile && swapon /swapfile
+  changed_when: true

@@ -1,0 +1,10 @@
+# Gerenciado pelo Ansible (KubeShop).
+[Unit]
+Description=Backup do MongoDB do KubeShop ({{ environment_name }}) para o S3
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/kubeshop-backup

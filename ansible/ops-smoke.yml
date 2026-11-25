@@ -1,0 +1,18 @@
+---
+# Rotina "smoke": teste funcional do próprio KubeShop (scripts/smoke.mjs da
+# imagem da API). Cria UM pedido fictício e confere que ele aparece na
+# consulta. Use para evidências de ponta a ponta.
+
+- name: Teste funcional (smoke)
+  hosts: app
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Executar o smoke test do KubeShop
+      ansible.builtin.command: docker exec api node /app/scripts/smoke.mjs http://frontend:8080
+      register: smoke
+      changed_when: true
+
+    - name: Resultado
+      ansible.builtin.debug:
+        msg: "{{ smoke.stdout | from_json }}"

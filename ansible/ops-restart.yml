@@ -1,0 +1,31 @@
+---
+# Rotina "restart": reinicia contêineres sem apagar dados e espera ficarem
+# saudáveis. Ordem: banco antes da aplicação.
+
+- name: Reiniciar serviços do KubeShop
+  hosts: db:app
+  become: true
+  gather_facts: false
+  serial: 1
+  vars:
+    service: all
+    host_containers: >-
+      {{ (['mongodb'] if 'db' in group_names else [])
+         + (['api', 'frontend', 'caddy'] if 'app' in group_names else []) }}
+    selected: "{{ host_containers if service == 'all' else (host_containers | select('equalto', service) | list) }}"
+    health_format: "{% raw %}{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}{% endraw %}"
+  tasks:
+    - name: Reiniciar contêiner
+      ansible.builtin.command: docker restart {{ item }}
+      loop: "{{ selected }}"
+      changed_when: true
+
+    - name: Aguardar ficar saudável
+      ansible.builtin.command:
+        argv: [docker, inspect, --format, "{{ health_format }}", "{{ item }}"]
+      loop: "{{ selected }}"
+      register: health
+      changed_when: false
+      until: health.stdout in ['healthy', 'running']
+      retries: 30
+      delay: 5

@@ -1,0 +1,138 @@
+name: "0. App - testes, build e publicação das imagens"
+
+# Representa o CI/CD da aplicação que a Zibiska Korp já possui (escopo, item
+# 7): testa o código do KubeShop, constrói as imagens da API e do frontend e
+# publica no GitHub Container Registry com uma tag de versão. Esse registry é
+# o ponto de integração com a infraestrutura: o workflow "1. Deploy" implanta
+# a tag informada em docker_tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag das imagens (ex.: 1.0.0, 1.1.0)"
+        type: string
+        default: "1.0.0"
+      source_ref:
+        description: "Commit ou branch do código (LaercioMLB/kube-shop-v2)"
+        type: string
+        default: ee30950799494e789d586369fb194e815b238691
+      run_tests:
+        description: Executar os testes da aplicação antes do build
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  SOURCE_REPO: LaercioMLB/kube-shop-v2
+
+jobs:
+  build:
+    name: Testar, construir e publicar
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validar a versão
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          re='^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'
+          [[ "$VERSION" =~ $re ]] || { echo "::error::version inválida"; exit 1; }
+
+      - name: Baixar o código da aplicação
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref }}
+          path: app
+          persist-credentials: false
+
+      - name: Instalar Node.js
+        if: ${{ inputs.run_tests }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24.15.0"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Testes da aplicação (API e interface)
+        if: ${{ inputs.run_tests }}
+        working-directory: app
+        run: |
+          npm ci --ignore-scripts
+          npm test
+
+      - name: Nomes e metadados das imagens
+        id: meta
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          {
+            echo "prefix=ghcr.io/${OWNER,,}/kubeshop"
+            echo "source_sha=$(git -C app rev-parse HEAD)"
+            echo "short_sha=$(git -C app rev-parse --short=7 HEAD)"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Preparar Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login no GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Imagem da API
+        uses: docker/build-push-action@v7
+        with:
+          context: app
+          file: app/apps/backend/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.prefix }}-api:${{ inputs.version }}
+            ${{ steps.meta.outputs.prefix }}-api:sha-${{ steps.meta.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.title=kubeshop-api
+            org.opencontainers.image.version=${{ inputs.version }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.source_sha }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Imagem do frontend
+        uses: docker/build-push-action@v7
+        with:
+          context: app
+          file: app/apps/frontend/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.prefix }}-frontend:${{ inputs.version }}
+            ${{ steps.meta.outputs.prefix }}-frontend:sha-${{ steps.meta.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.title=kubeshop-frontend
+            org.opencontainers.image.version=${{ inputs.version }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.source_sha }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+      - name: Resumo
+        env:
+          PREFIX: ${{ steps.meta.outputs.prefix }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ steps.meta.outputs.source_sha }}
+        run: |
+          {
+            echo "### Imagens publicadas"
+            echo "- ${PREFIX}-api:${VERSION}"
+            echo "- ${PREFIX}-frontend:${VERSION}"
+            echo "- Código: ${SOURCE_REPO}@${SOURCE_SHA}"
+            echo
+            echo "Próximo passo: workflow **1. Deploy** com docker_tag=${VERSION}."
+          } >>"$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,11 @@
+# Gerenciado pelo Ansible (KubeShop).
+[Unit]
+Description=Backup diário do MongoDB do KubeShop ({{ environment_name }})
+
+[Timer]
+OnCalendar={{ backup_schedule }}
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

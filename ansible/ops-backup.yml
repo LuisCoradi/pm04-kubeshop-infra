@@ -1,0 +1,23 @@
+---
+# Rotina "backup": executa agora o mesmo backup do agendamento diário.
+
+- name: Backup do MongoDB
+  hosts: db
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Executar backup (mongodump -> S3)
+      ansible.builtin.command: /usr/local/bin/kubeshop-backup
+      register: backup
+      changed_when: true
+
+    - name: Próxima execução automática
+      ansible.builtin.command: systemctl list-timers kubeshop-backup.timer --no-pager # noqa: command-instead-of-module
+      register: timer
+      changed_when: false
+
+    - name: Resultado
+      ansible.builtin.debug:
+        msg:
+          - "{{ backup.stdout | from_json }}"
+          - "{{ timer.stdout_lines[:2] }}"

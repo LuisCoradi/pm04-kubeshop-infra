@@ -1,0 +1,85 @@
+---
+# Chamado com deploy_version = versão a implantar (ou a anterior, no rollback).
+
+- name: Baixar as imagens antes de trocar os contêineres - {{ deploy_version }}
+  community.docker.docker_image_pull:
+    name: "{{ item }}"
+    tag: "{{ deploy_version }}"
+    pull: "{{ 'always' if deploy_version in mutable_tags else 'not_present' }}"
+  loop:
+    - "{{ api_image }}"
+    - "{{ frontend_image }}"
+
+- name: API {{ deploy_version }}
+  community.docker.docker_container:
+    name: api
+    image: "{{ api_image }}:{{ deploy_version }}"
+    pull: missing
+    networks:
+      - name: kubeshop
+    env:
+      NODE_ENV: production
+      HOST: "0.0.0.0"
+      PORT: "3000"
+      APP_VERSION: "{{ deploy_version }}"
+      MONGO_HOST: "{{ db_private_ip }}"
+      MONGO_PORT: "{{ mongo_port | string }}"
+      MONGO_DATABASE: "{{ mongo_database }}"
+      MONGO_AUTH_SOURCE: "{{ mongo_database }}"
+      MONGO_USERNAME: "{{ mongo_app_username }}"
+      MONGO_PASSWORD_FILE: /run/secrets/mongo_app_password
+    volumes:
+      - "{{ kubeshop_dir }}/secrets/mongo-app-password:/run/secrets/mongo_app_password:ro"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opts:
+      - no-new-privileges:true
+    init: true
+    stop_timeout: 20
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/health/ready',{signal:AbortSignal.timeout(2500)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 4s
+      retries: 3
+      start_period: 30s
+    restart_policy: unless-stopped
+    labels:
+      app.kubeshop.component: api
+      app.kubeshop.version: "{{ deploy_version }}"
+    state: healthy
+    healthy_wait_timeout: 150
+
+- name: Frontend {{ deploy_version }}
+  community.docker.docker_container:
+    name: frontend
+    image: "{{ frontend_image }}:{{ deploy_version }}"
+    pull: missing
+    networks:
+      - name: kubeshop
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opts:
+      - no-new-privileges:true
+    init: true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart_policy: unless-stopped
+    labels:
+      app.kubeshop.component: frontend
+      app.kubeshop.version: "{{ deploy_version }}"
+    state: healthy
+    healthy_wait_timeout: 90

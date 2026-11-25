@@ -1,0 +1,131 @@
+---
+# API e frontend nas versões pedidas (docker_tag), com atualização controlada:
+# baixa as imagens antes de mexer em qualquer contêiner, troca a API, espera
+# ficar saudável, troca o frontend. Se a nova versão não ficar saudável, volta
+# para a versão anterior e marca a execução como falha.
+
+- name: Gravar a senha do app no MongoDB (lida pela API, usuário node 1000)
+  ansible.builtin.copy:
+    content: "{{ mongo_app_password }}"
+    dest: "{{ kubeshop_dir }}/secrets/mongo-app-password"
+    owner: "1000"
+    group: "1000"
+    mode: "0400"
+  no_log: true
+
+- name: Criar a rede Docker da aplicação
+  community.docker.docker_network:
+    name: kubeshop
+
+- name: Consultar a versão implantada atualmente
+  ansible.builtin.slurp:
+    src: "{{ kubeshop_dir }}/deployed-version"
+  register: deployed_version_file
+  failed_when: false
+
+- name: Registrar a versão anterior (para rollback)
+  ansible.builtin.set_fact:
+    previous_version: >-
+      {{ (deployed_version_file.content | b64decode | trim)
+         if deployed_version_file.content is defined else '' }}
+
+- name: Informar a atualização
+  ansible.builtin.debug:
+    msg: >-
+      Versão implantada: {{ previous_version | default('nenhuma', true) }} ->
+      solicitada: {{ app_version }} ({{ api_image }} / {{ frontend_image }})
+
+- name: Implantar API e frontend
+  block:
+    # O login no registry é temporário (logout no final) e não altera o estado
+    # desejado da VM, por isso não conta como mudança.
+    - name: Autenticar no registry de imagens
+      community.docker.docker_login:
+        registry_url: "{{ registry_host }}"
+        username: "{{ registry_username }}"
+        password: "{{ registry_password }}"
+        reauthorize: true
+      changed_when: false
+      no_log: true
+      when:
+        - registry_username | length > 0
+        - registry_password | length > 0
+
+    - name: Atualizar para a versão solicitada
+      block:
+        - name: Implantar a versão {{ app_version }}
+          ansible.builtin.include_tasks: app_services.yml
+          vars:
+            deploy_version: "{{ app_version }}"
+      rescue:
+        - name: Voltar para a versão anterior
+          ansible.builtin.include_tasks: app_services.yml
+          vars:
+            deploy_version: "{{ previous_version }}"
+          when:
+            - rollback_on_failure | bool
+            - previous_version | length > 0
+            - previous_version != app_version
+
+        - name: Interromper a pipeline
+          ansible.builtin.fail:
+            msg: >-
+              A versão {{ app_version }} não ficou saudável.
+              {{ ('Aplicação revertida para ' ~ previous_version ~ '.')
+                 if (rollback_on_failure | bool and previous_version | length > 0 and previous_version != app_version)
+                 else 'Não havia versão anterior para reverter.' }}
+              Veja os logs com a rotina "logs" do workflow Operações.
+  always:
+    - name: Encerrar a sessão no registry
+      community.docker.docker_login:
+        registry_url: "{{ registry_host }}"
+        state: absent
+      changed_when: false
+      when: registry_username | length > 0
+
+- name: Registrar a versão implantada
+  ansible.builtin.copy:
+    content: "{{ app_version }}\n"
+    dest: "{{ kubeshop_dir }}/deployed-version"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Criar diretório de configuração do Caddy
+  ansible.builtin.file:
+    path: "{{ kubeshop_dir }}/caddy"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Configurar o Caddy (HTTP pelo IP ou HTTPS automático pelo domínio)
+  ansible.builtin.template:
+    src: Caddyfile.j2
+    dest: "{{ kubeshop_dir }}/caddy/Caddyfile"
+    owner: root
+    group: root
+    mode: "0644"
+  register: caddyfile
+
+- name: Caddy - entrada pública (80/443)
+  community.docker.docker_container:
+    name: caddy
+    image: "{{ caddy_image }}"
+    pull: missing
+    networks:
+      - name: kubeshop
+    published_ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "{{ kubeshop_dir }}/caddy/Caddyfile:/etc/caddy/Caddyfile:ro"
+      - caddy-data:/data
+      - caddy-config:/config
+    security_opts:
+      - no-new-privileges:true
+    restart_policy: unless-stopped
+    restart: "{{ caddyfile is changed }}"
+    labels:
+      app.kubeshop.component: caddy
+    state: started

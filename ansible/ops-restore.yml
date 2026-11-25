@@ -1,0 +1,37 @@
+---
+# Rotinas "restore-verify" e "restore-replace".
+#   restore_mode=verify  -> restaura em contêiner temporário isolado e confere
+#   restore_mode=replace -> backup de segurança + substitui os dados em uso
+#                           (exige confirm="RESTAURAR <ambiente>")
+
+- name: Restauração do MongoDB
+  hosts: db
+  become: true
+  gather_facts: false
+  vars:
+    restore_mode: verify
+    backup_ref: latest
+    confirm: ""
+  tasks:
+    - name: Validar o modo
+      ansible.builtin.assert:
+        that: restore_mode in ['verify', 'replace']
+        quiet: true
+
+    - name: Exigir confirmação para substituir os dados
+      ansible.builtin.assert:
+        that: confirm == 'RESTAURAR ' ~ environment_name
+        fail_msg: 'Para substituir os dados digite exatamente: RESTAURAR {{ environment_name }}'
+        quiet: true
+      when: restore_mode == 'replace'
+
+    - name: Restaurar ({{ restore_mode }})
+      ansible.builtin.command: /usr/local/bin/kubeshop-restore {{ restore_mode }} {{ backup_ref }}
+      environment:
+        CONFIRM: "{{ confirm }}"
+      register: restore
+      changed_when: restore_mode == 'replace'
+
+    - name: Resultado
+      ansible.builtin.debug:
+        msg: "{{ restore.stdout | from_json }}"
