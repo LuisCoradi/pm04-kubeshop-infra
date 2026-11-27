@@ -61,8 +61,9 @@ live_orders="$(count_live)"
 
 if [ "$mode" = "verify" ]; then
   docker rm -f "$test_container" >/dev/null 2>&1 || true
-  docker run -d --name "$test_container" --network none --memory 400m \
-    "$MONGO_IMAGE" --wiredTigerCacheSizeGB 0.1 >/dev/null
+  # O MongoDB exige no mínimo 0.25 GB de cache.
+  docker run -d --name "$test_container" --network none --memory 512m \
+    "$MONGO_IMAGE" --wiredTigerCacheSizeGB 0.25 >/dev/null
 
   for _ in $(seq 1 30); do
     if docker exec "$test_container" mongosh --quiet --norc \
@@ -71,6 +72,12 @@ if [ "$mode" = "verify" ]; then
     fi
     sleep 2
   done
+
+  if [ -z "$(docker ps -q --filter "name=^${test_container}$" --filter status=running)" ]; then
+    echo "O MongoDB temporário não iniciou. Últimas linhas do log:" >&2
+    docker logs --tail 30 "$test_container" >&2 || true
+    exit 1
+  fi
 
   docker exec -i "$test_container" mongorestore --quiet --archive --gzip \
     --nsInclude="${MONGO_DATABASE}.*" <"$archive"
